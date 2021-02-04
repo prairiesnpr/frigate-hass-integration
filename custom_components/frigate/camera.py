@@ -1,6 +1,7 @@
 """Support for Frigate cameras."""
 import async_timeout
 from typing import Dict
+from datetime import datetime as dt
 import urllib.parse
 import logging
 
@@ -32,8 +33,9 @@ async def async_setup_entry(
 
     camera_objects = [(cam_name, obj) for cam_name, cam_config in config["cameras"].items() for obj in cam_config["objects"]["track"]]
     mqtt_entities = [FrigateMqttSnapshots(hass, entry, config, cam_name, obj_name) for cam_name, obj_name in camera_objects]
+    mqtt_latest_entities = [FrigateMqttLastSnapshot(hass, entry, config, cam_name) for cam_name, cam_config in config["cameras"].items()]
 
-    async_add_entities(entities + mqtt_entities)
+    async_add_entities(entities + mqtt_entities + mqtt_latest_entities)
 
 
 class FrigateCamera(Camera):
@@ -127,6 +129,7 @@ class FrigateMqttSnapshots(Camera):
         self._sub_state = None
         self._topic = f"{self._frigate_config['mqtt']['topic_prefix']}/{self._cam_name}/{self._obj_name}/snapshot"
         self._availability_topic = f"{self._frigate_config['mqtt']['topic_prefix']}/available"
+        self._last_detection = None
 
     async def async_added_to_hass(self):
         """Subscribe mqtt events."""
@@ -139,6 +142,7 @@ class FrigateMqttSnapshots(Camera):
         def state_message_received(msg):
             """Handle a new received MQTT state message."""
             self._last_image = msg.payload
+            self._last_detection = dt.now()
 
         @callback
         def availability_message_received(msg):
@@ -207,3 +211,91 @@ class FrigateMqttSnapshots(Camera):
         if self._last_image is None:
             return STATE_IDLE
         return STATE_DETECTED
+
+    @property
+    def state_attributes(self):
+        """Return the camera state attributes."""
+        attrs = super().state_attributes
+
+        attrs["last_detection"] = self._last_detection
+
+        return attrs
+
+
+class FrigateMqttLastSnapshot(FrigateMqttSnapshots):
+    """Frigate lastest camera class."""
+
+    def __init__(self, hass, entry, frigate_config, cam_name):
+        super().__init__(hass, entry, frigate_config, cam_name, None)
+        self._topic = f"{self._frigate_config['mqtt']['topic_prefix']}/{self._cam_name}/+/snapshot"
+        self._availability_topic = f"{self._frigate_config['mqtt']['topic_prefix']}/available"
+
+    async def _subscribe_topics(self):
+        """(Re)Subscribe to topics."""
+        @callback
+        def state_message_received(msg):
+            """Handle a new received MQTT state message."""
+            self._last_image = msg.payload
+            self._last_detection = dt.now()
+            self._obj_name = msg.topic.split("/")[-2]
+
+        @callback
+        def availability_message_received(msg):
+            """Handle a new received MQTT availability message."""
+            payload = msg.payload
+
+            if payload == "online":
+                self._available = True
+            elif payload == "offline":
+                self._available = False
+            else:
+                _LOGGER.info(f"Invalid payload received for {self.name}")
+                return
+
+            self.async_write_ha_state()
+
+        self._sub_state = await async_subscribe_topics(
+            self.hass,
+            self._sub_state,
+            {
+                "state_topic": {
+                    "topic": self._topic,
+                    "msg_callback": state_message_received,
+                    "qos": 0,
+                    "encoding": None
+                },
+                "availability_topic": {
+                    "topic": self._availability_topic,
+                    "msg_callback": availability_message_received,
+                    "qos": 0,
+                }
+            },
+        )
+
+    @property
+    def unique_id(self):
+        """Return a unique ID to use for this entity."""
+        return f"{DOMAIN}_{self._cam_name}_latest_snapshot"
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, self._entry.entry_id)},
+            "name": NAME,
+            "model": VERSION,
+            "manufacturer": NAME,
+        }
+
+    @property
+    def name(self):
+        """Return the name of the sensor."""
+        friendly_camera_name = self._cam_name.replace('_', ' ')
+        return f"{friendly_camera_name} Latest".title()
+
+    @property
+    def state_attributes(self):
+        """Return the camera state attributes."""
+        attrs = super().state_attributes
+        attrs["object"] = self._obj_name
+
+        return attrs
